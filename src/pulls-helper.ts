@@ -23,6 +23,61 @@ export class PullsHelper {
     excludeDrafts: boolean
   ): Promise<Pull[]> {
     const [owner, repo] = repository.split('/')
+
+    const isRebaseable = (p: Edge): boolean =>
+      // Filter out pull requests where the head repo and/or branch has been deleted prematurely
+      !!p.node.headRepository &&
+      // Filter on head owner since the query only filters on head ref
+      (headOwner.length == 0 ||
+        p.node.headRepositoryOwner.login == headOwner) &&
+      // Filter heads from forks where 'maintainer can modify' is false
+      (p.node.headRepositoryOwner.login == owner ||
+        p.node.maintainerCanModify) &&
+      // Filter out pull requests with labels in the exclude list
+      p.node.labels.nodes.every(function (value: Label): boolean {
+        // Every label is not in the exclude list
+        return !excludeLabels.includes(value.name)
+      }) &&
+      // Filter out drafts if set to exclude
+      (!excludeDrafts || p.node.isDraft == false)
+
+    const hasIncludedLabel = (p: Edge): boolean =>
+      includeLabels.length == 0 ||
+      p.node.labels.nodes.some(function (value: Label): boolean {
+        // At least one label is in the include list
+        return includeLabels.includes(value.name)
+      })
+
+    const filteredPulls = (await this.query(owner, repo, head, base))
+      .filter(p => isRebaseable(p) && hasIncludedLabel(p))
+      .map(toPull)
+    core.debug(`filteredPulls: ${inspect(filteredPulls)}`)
+
+    // A pull request stacked on a selected pull request must be rebased with
+    // it, otherwise it is left behind on the base's previous commits.
+    const seen = new Set(filteredPulls.map(pullKey))
+    for (let i = 0; i < filteredPulls.length; i++) {
+      const parent = filteredPulls[i]
+      if (!isSameRepository(parent.headRepoName, repository)) continue
+      const children = (await this.query(owner, repo, '', parent.headRef))
+        .filter(isRebaseable)
+        .map(toPull)
+      for (const child of children) {
+        if (seen.has(pullKey(child))) continue
+        seen.add(pullKey(child))
+        filteredPulls.push(child)
+      }
+    }
+
+    return sortParentsFirst(filteredPulls, repository)
+  }
+
+  private async query(
+    owner: string,
+    repo: string,
+    head: string,
+    base: string
+  ): Promise<Edge[]> {
     const params: OctokitTypes.RequestParameters = {
       owner: owner,
       repo: repo
@@ -57,45 +112,47 @@ export class PullsHelper {
     }`
     const pulls = await this.octokit.graphql<Pulls>(query, params)
     core.debug(`Pulls: ${inspect(pulls.repository.pullRequests.edges)}`)
-
-    const filteredPulls = pulls.repository.pullRequests.edges
-      .map(p => {
-        if (
-          // Filter out pull requests where the head repo and/or branch has been deleted prematurely
-          p.node.headRepository &&
-          // Filter on head owner since the query only filters on head ref
-          (headOwner.length == 0 ||
-            p.node.headRepositoryOwner.login == headOwner) &&
-          // Filter heads from forks where 'maintainer can modify' is false
-          (p.node.headRepositoryOwner.login == owner ||
-            p.node.maintainerCanModify) &&
-          // Filter out pull requests that do not have labels in the include list
-          (includeLabels.length == 0 ||
-            p.node.labels.nodes.some(function (value: Label): boolean {
-              // At least one label is in the include list
-              return includeLabels.includes(value.name)
-            })) &&
-          // Filter out pull requests with labels in the exclude list
-          p.node.labels.nodes.every(function (value: Label): boolean {
-            // Every label is not in the exclude list
-            return !excludeLabels.includes(value.name)
-          }) &&
-          // Filter out drafts if set to exclude
-          (!excludeDrafts || p.node.isDraft == false)
-        ) {
-          return new Pull(
-            p.node.baseRefName,
-            p.node.headRepository.url,
-            p.node.headRepository.nameWithOwner,
-            p.node.headRefName
-          )
-        }
-      })
-      .filter(notUndefined)
-    core.debug(`filteredPulls: ${inspect(filteredPulls)}`)
-
-    return filteredPulls
+    return pulls.repository.pullRequests.edges
   }
+}
+
+/**
+ * Orders pull requests so that each one comes after the pull request whose
+ * head ref is its base ref. Otherwise keeps the given order.
+ */
+export function sortParentsFirst(pulls: Pull[], repository: string): Pull[] {
+  const byHeadRef = new Map(
+    pulls
+      .filter(p => isSameRepository(p.headRepoName, repository))
+      .map(p => [p.headRef, p])
+  )
+  const depth = (pull: Pull, visited: Set<Pull>): number => {
+    const parent = byHeadRef.get(pull.baseRef)
+    if (!parent || visited.has(parent)) return 0
+    visited.add(parent)
+    return depth(parent, visited) + 1
+  }
+  return pulls
+    .map(pull => ({pull, depth: depth(pull, new Set([pull]))}))
+    .sort((a, b) => a.depth - b.depth)
+    .map(p => p.pull)
+}
+
+export function isSameRepository(a: string, b: string): boolean {
+  return a.toLowerCase() == b.toLowerCase()
+}
+
+function toPull(p: Edge): Pull {
+  return new Pull(
+    p.node.baseRefName,
+    p.node.headRepository.url,
+    p.node.headRepository.nameWithOwner,
+    p.node.headRefName
+  )
+}
+
+function pullKey(p: Pull): string {
+  return `${p.headRepoName}:${p.headRef}`
 }
 
 type Label = {
@@ -145,8 +202,4 @@ export class Pull {
     this.headRepoName = headRepoName
     this.headRef = headRef
   }
-}
-
-function notUndefined<T>(x: T | undefined): x is T {
-  return x !== undefined
 }

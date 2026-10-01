@@ -1,15 +1,18 @@
 import * as core from '@actions/core'
 import {GitCommandManager} from './git-command-manager'
-import {Pull} from './pulls-helper'
+import {Pull, isSameRepository} from './pulls-helper'
 import {v4 as uuidv4} from 'uuid'
 
 export class RebaseHelper {
   private git: GitCommandManager
   private extraOptions: string[]
+  private repository: string
+  private rebasedRefs = new Map<string, {from: string; to: string}>()
 
-  constructor(git: GitCommandManager, options: string[]) {
+  constructor(git: GitCommandManager, options: string[], repository: string) {
     this.git = git
     this.extraOptions = options
+    this.repository = repository
   }
 
   async rebase(pull: Pull): Promise<boolean> {
@@ -47,8 +50,23 @@ export class RebaseHelper {
     core.endGroup()
 
     // Rebase
-    core.startGroup(`Rebasing on base ref '${pull.baseRef}'.`)
-    const result = await this.tryRebase('origin', pull.baseRef)
+    // origin/<base ref> still points at the base's commits from before it was
+    // rebased, so replay only this pull request's own commits onto the new tip.
+    const rebasedBase = this.rebasedRefs.get(pull.baseRef)
+    let result: RebaseResult
+    if (rebasedBase) {
+      core.startGroup(
+        `Rebasing on base ref '${pull.baseRef}', which was rebased from '${rebasedBase.from}' to '${rebasedBase.to}'.`
+      )
+      result = await this.tryRebase([
+        '--onto',
+        rebasedBase.to,
+        rebasedBase.from
+      ])
+    } else {
+      core.startGroup(`Rebasing on base ref '${pull.baseRef}'.`)
+      result = await this.tryRebase([`origin/${pull.baseRef}`])
+    }
     core.endGroup()
 
     if (result == RebaseResult.Rebased) {
@@ -59,6 +77,12 @@ export class RebaseHelper {
         `HEAD:${pull.headRef}`
       ])
       core.endGroup()
+      if (isSameRepository(pull.headRepoName, this.repository)) {
+        this.rebasedRefs.set(pull.headRef, {
+          from: sha,
+          to: await this.git.revParse('HEAD')
+        })
+      }
       core.info(`Head ref '${pull.headRef}' successfully rebased.`)
       return true
     } else if (result == RebaseResult.AlreadyUpToDate) {
@@ -83,15 +107,12 @@ export class RebaseHelper {
     return output.stdout.trim()
   }
 
-  private async tryRebase(
-    remoteName: string,
-    ref: string
-  ): Promise<RebaseResult> {
+  private async tryRebase(args: string[]): Promise<RebaseResult> {
     try {
       const result = await this.git.exec([
         'rebase',
         ...this.extraOptions,
-        `${remoteName}/${ref}`
+        ...args
       ])
       return result ? RebaseResult.Rebased : RebaseResult.AlreadyUpToDate
     } catch {

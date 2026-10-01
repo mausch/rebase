@@ -419,7 +419,7 @@ function run() {
                 // Rebase
                 // Create a git command manager
                 const git = yield git_command_manager_1.GitCommandManager.create(sourceSettings.repositoryPath);
-                const rebaseHelper = new rebase_helper_1.RebaseHelper(git, inputs.rebaseOptions);
+                const rebaseHelper = new rebase_helper_1.RebaseHelper(git, inputs.rebaseOptions, inputs.repository);
                 let rebasedCount = 0;
                 for (const pull of pulls) {
                     const result = yield rebaseHelper.rebase(pull);
@@ -484,7 +484,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.Pull = exports.PullsHelper = void 0;
+exports.Pull = exports.isSameRepository = exports.sortParentsFirst = exports.PullsHelper = void 0;
 const core = __importStar(__nccwpck_require__(2186));
 const core_1 = __nccwpck_require__(6762);
 const util_1 = __nccwpck_require__(1669);
@@ -498,6 +498,53 @@ class PullsHelper {
     get(repository, head, headOwner, base, includeLabels, excludeLabels, excludeDrafts) {
         return __awaiter(this, void 0, void 0, function* () {
             const [owner, repo] = repository.split('/');
+            const isRebaseable = (p) => 
+            // Filter out pull requests where the head repo and/or branch has been deleted prematurely
+            !!p.node.headRepository &&
+                // Filter on head owner since the query only filters on head ref
+                (headOwner.length == 0 ||
+                    p.node.headRepositoryOwner.login == headOwner) &&
+                // Filter heads from forks where 'maintainer can modify' is false
+                (p.node.headRepositoryOwner.login == owner ||
+                    p.node.maintainerCanModify) &&
+                // Filter out pull requests with labels in the exclude list
+                p.node.labels.nodes.every(function (value) {
+                    // Every label is not in the exclude list
+                    return !excludeLabels.includes(value.name);
+                }) &&
+                // Filter out drafts if set to exclude
+                (!excludeDrafts || p.node.isDraft == false);
+            const hasIncludedLabel = (p) => includeLabels.length == 0 ||
+                p.node.labels.nodes.some(function (value) {
+                    // At least one label is in the include list
+                    return includeLabels.includes(value.name);
+                });
+            const filteredPulls = (yield this.query(owner, repo, head, base))
+                .filter(p => isRebaseable(p) && hasIncludedLabel(p))
+                .map(toPull);
+            core.debug(`filteredPulls: ${(0, util_1.inspect)(filteredPulls)}`);
+            // A pull request stacked on a selected pull request must be rebased with
+            // it, otherwise it is left behind on the base's previous commits.
+            const seen = new Set(filteredPulls.map(pullKey));
+            for (let i = 0; i < filteredPulls.length; i++) {
+                const parent = filteredPulls[i];
+                if (!isSameRepository(parent.headRepoName, repository))
+                    continue;
+                const children = (yield this.query(owner, repo, '', parent.headRef))
+                    .filter(isRebaseable)
+                    .map(toPull);
+                for (const child of children) {
+                    if (seen.has(pullKey(child)))
+                        continue;
+                    seen.add(pullKey(child));
+                    filteredPulls.push(child);
+                }
+            }
+            return sortParentsFirst(filteredPulls, repository);
+        });
+    }
+    query(owner, repo, head, base) {
+        return __awaiter(this, void 0, void 0, function* () {
             const params = {
                 owner: owner,
                 repo: repo
@@ -534,40 +581,42 @@ class PullsHelper {
     }`;
             const pulls = yield this.octokit.graphql(query, params);
             core.debug(`Pulls: ${(0, util_1.inspect)(pulls.repository.pullRequests.edges)}`);
-            const filteredPulls = pulls.repository.pullRequests.edges
-                .map(p => {
-                if (
-                // Filter out pull requests where the head repo and/or branch has been deleted prematurely
-                p.node.headRepository &&
-                    // Filter on head owner since the query only filters on head ref
-                    (headOwner.length == 0 ||
-                        p.node.headRepositoryOwner.login == headOwner) &&
-                    // Filter heads from forks where 'maintainer can modify' is false
-                    (p.node.headRepositoryOwner.login == owner ||
-                        p.node.maintainerCanModify) &&
-                    // Filter out pull requests that do not have labels in the include list
-                    (includeLabels.length == 0 ||
-                        p.node.labels.nodes.some(function (value) {
-                            // At least one label is in the include list
-                            return includeLabels.includes(value.name);
-                        })) &&
-                    // Filter out pull requests with labels in the exclude list
-                    p.node.labels.nodes.every(function (value) {
-                        // Every label is not in the exclude list
-                        return !excludeLabels.includes(value.name);
-                    }) &&
-                    // Filter out drafts if set to exclude
-                    (!excludeDrafts || p.node.isDraft == false)) {
-                    return new Pull(p.node.baseRefName, p.node.headRepository.url, p.node.headRepository.nameWithOwner, p.node.headRefName);
-                }
-            })
-                .filter(notUndefined);
-            core.debug(`filteredPulls: ${(0, util_1.inspect)(filteredPulls)}`);
-            return filteredPulls;
+            return pulls.repository.pullRequests.edges;
         });
     }
 }
 exports.PullsHelper = PullsHelper;
+/**
+ * Orders pull requests so that each one comes after the pull request whose
+ * head ref is its base ref. Otherwise keeps the given order.
+ */
+function sortParentsFirst(pulls, repository) {
+    const byHeadRef = new Map(pulls
+        .filter(p => isSameRepository(p.headRepoName, repository))
+        .map(p => [p.headRef, p]));
+    const depth = (pull, visited) => {
+        const parent = byHeadRef.get(pull.baseRef);
+        if (!parent || visited.has(parent))
+            return 0;
+        visited.add(parent);
+        return depth(parent, visited) + 1;
+    };
+    return pulls
+        .map(pull => ({ pull, depth: depth(pull, new Set([pull])) }))
+        .sort((a, b) => a.depth - b.depth)
+        .map(p => p.pull);
+}
+exports.sortParentsFirst = sortParentsFirst;
+function isSameRepository(a, b) {
+    return a.toLowerCase() == b.toLowerCase();
+}
+exports.isSameRepository = isSameRepository;
+function toPull(p) {
+    return new Pull(p.node.baseRefName, p.node.headRepository.url, p.node.headRepository.nameWithOwner, p.node.headRefName);
+}
+function pullKey(p) {
+    return `${p.headRepoName}:${p.headRef}`;
+}
 class Pull {
     constructor(baseRef, headRepoUrl, headRepoName, headRef) {
         this.baseRef = baseRef;
@@ -577,9 +626,6 @@ class Pull {
     }
 }
 exports.Pull = Pull;
-function notUndefined(x) {
-    return x !== undefined;
-}
 
 
 /***/ }),
@@ -624,11 +670,14 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.RebaseHelper = void 0;
 const core = __importStar(__nccwpck_require__(2186));
+const pulls_helper_1 = __nccwpck_require__(3633);
 const uuid_1 = __nccwpck_require__(5840);
 class RebaseHelper {
-    constructor(git, options) {
+    constructor(git, options, repository) {
+        this.rebasedRefs = new Map();
         this.git = git;
         this.extraOptions = options;
+        this.repository = repository;
     }
     rebase(pull) {
         return __awaiter(this, void 0, void 0, function* () {
@@ -654,8 +703,22 @@ class RebaseHelper {
             yield this.git.config('user.email', committerEmail);
             core.endGroup();
             // Rebase
-            core.startGroup(`Rebasing on base ref '${pull.baseRef}'.`);
-            const result = yield this.tryRebase('origin', pull.baseRef);
+            // origin/<base ref> still points at the base's commits from before it was
+            // rebased, so replay only this pull request's own commits onto the new tip.
+            const rebasedBase = this.rebasedRefs.get(pull.baseRef);
+            let result;
+            if (rebasedBase) {
+                core.startGroup(`Rebasing on base ref '${pull.baseRef}', which was rebased from '${rebasedBase.from}' to '${rebasedBase.to}'.`);
+                result = yield this.tryRebase([
+                    '--onto',
+                    rebasedBase.to,
+                    rebasedBase.from
+                ]);
+            }
+            else {
+                core.startGroup(`Rebasing on base ref '${pull.baseRef}'.`);
+                result = yield this.tryRebase([`origin/${pull.baseRef}`]);
+            }
             core.endGroup();
             if (result == RebaseResult.Rebased) {
                 core.startGroup(`Pushing changes to head ref '${pull.headRef}'`);
@@ -665,6 +728,12 @@ class RebaseHelper {
                     `HEAD:${pull.headRef}`
                 ]);
                 core.endGroup();
+                if ((0, pulls_helper_1.isSameRepository)(pull.headRepoName, this.repository)) {
+                    this.rebasedRefs.set(pull.headRef, {
+                        from: sha,
+                        to: yield this.git.revParse('HEAD')
+                    });
+                }
                 core.info(`Head ref '${pull.headRef}' successfully rebased.`);
                 return true;
             }
@@ -687,13 +756,13 @@ class RebaseHelper {
             return output.stdout.trim();
         });
     }
-    tryRebase(remoteName, ref) {
+    tryRebase(args) {
         return __awaiter(this, void 0, void 0, function* () {
             try {
                 const result = yield this.git.exec([
                     'rebase',
                     ...this.extraOptions,
-                    `${remoteName}/${ref}`
+                    ...args
                 ]);
                 return result ? RebaseResult.Rebased : RebaseResult.AlreadyUpToDate;
             }
